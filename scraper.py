@@ -1,7 +1,10 @@
 """KBO 기록실 HTML 수집기. 영구 저장 없이 10분 메모리 캐시만 사용한다."""
 from __future__ import annotations
 
+import re
+import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import requests
@@ -13,12 +16,15 @@ HEADERS = {
     "Referer": "https://www.koreabaseball.com/Record/Player/HitterBasic/Basic1.aspx",
 }
 CACHE_TTL = 600
-_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_cache: dict[str, tuple[float, Any]] = {}
 ARCHIVE_URL = "https://huggingface.co/datasets/juhonov/KBOresearch/resolve/main/kbo_{kind}_stats_2000_2025.json"
 HISTORY_RANKING_URL = "https://www.yagoonara.com/api/rankings"
 STANDINGS_URL = "https://www.yagoonara.com/api/standings"
 PLAYER_SEARCH_URL = "https://www.yagoonara.com/api/players"
 PLAYER_MATCHUP_URL = "https://www.yagoonara.com/api/matchups/player"
+PLAYER_DETAIL_URL = "https://www.yagoonara.com/api/players/{player_id}"
+TEAM_LIST_URL = "https://www.yagoonara.com/api/teams"
+TEAM_DETAIL_URL = "https://www.yagoonara.com/api/teams/{team_id}"
 
 HITTER_COLUMNS = ["rank", "name", "team", "AVG", "G", "PA", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "HBP", "SO", "GDP", "E"]
 PITCHER_COLUMNS = ["rank", "name", "team", "ERA", "G", "W", "L", "SV", "HLD", "WPCT", "IP", "H", "HR", "BB", "HBP", "SO", "R", "ER", "WHIP"]
@@ -252,6 +258,20 @@ def fetch_game_relay(game_id: str, inning: int | None = None) -> dict[str, Any]:
     response.raise_for_status()
     relay = response.json().get("result", {}).get("textRelayData") or {}
 
+    player_lookup: dict[str, dict[str, Any]] = {}
+    for side_name in ("away", "home"):
+        side_lineup = relay.get(f"{side_name}Lineup") or {}
+        for role in ("batter", "pitcher"):
+            for row in side_lineup.get(role) or []:
+                pcode = str(row.get("pcode") or "")
+                if pcode:
+                    player_lookup[pcode] = {
+                        "name": row.get("name") or "",
+                        "pcode": pcode,
+                        "back_number": str(row.get("backnum") or ""),
+                        "throws_bats": row.get("hitType") or "",
+                    }
+
     def lineup(side: str) -> list[dict[str, Any]]:
         batters = (relay.get(f"{side}Lineup") or {}).get("batter") or []
         return [
@@ -266,10 +286,79 @@ def fetch_game_relay(game_id: str, inning: int | None = None) -> dict[str, Any]:
         ]
 
     inning_batters: dict[str, list[dict[str, Any]]] = {"away": [], "home": []}
+    at_bats: dict[str, list[dict[str, Any]]] = {"away": [], "home": []}
     seen: dict[str, set[str]] = {"away": set(), "home": set()}
     for relay_row in relay.get("textRelays") or []:
         side = "home" if str(relay_row.get("homeOrAway")) == "1" else "away"
-        for option in relay_row.get("textOptions") or []:
+        options = relay_row.get("textOptions") or []
+        batter_option = next((option for option in options if option.get("batterRecord")), None)
+        if batter_option:
+            batter = batter_option.get("batterRecord") or {}
+            pts_by_number = {
+                int(point.get("ballcount") or 0): point
+                for point in relay_row.get("ptsOptions") or []
+                if point.get("ballcount")
+            }
+            pitches: list[dict[str, Any]] = []
+            result = ""
+            pitcher_pcode = ""
+            for option in options:
+                text = str(option.get("text") or "").strip()
+                pitch_match = re.match(r"^(\d+)구\s+(.+)$", text)
+                if int(option.get("type") or 0) == 1 and pitch_match:
+                    pitch_number = int(pitch_match.group(1))
+                    point = pts_by_number.get(pitch_number) or {}
+                    speed_value = option.get("speed") or option.get("velocity")
+                    state = option.get("currentGameState") or {}
+                    state_pitcher = state.get("pitcher")
+                    pitcher_pcode = str(
+                        state_pitcher.get("pcode") if isinstance(state_pitcher, dict) else state_pitcher or pitcher_pcode
+                    )
+                    plate_x = point.get("crossPlateX")
+                    plate_y = point.get("crossPlateY")
+                    plate_z = None
+                    try:
+                        ay, vy0 = float(point["ay"]), float(point["vy0"])
+                        distance = float(point["y0"]) - float(plate_y)
+                        discriminant = vy0 * vy0 - 2 * ay * distance
+                        roots = [(-vy0 + sign * math.sqrt(discriminant)) / ay for sign in (-1, 1)]
+                        flight_time = min(root for root in roots if root > 0)
+                        plate_z = float(point["z0"]) + float(point["vz0"]) * flight_time + 0.5 * float(point["az"]) * flight_time**2
+                    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                        pass
+                    top_sz = float(point.get("topSz") or 3.5)
+                    bottom_sz = float(point.get("bottomSz") or 1.5)
+                    x_percent = max(3, min(97, (float(plate_x) + 1.5) / 3 * 100)) if plate_x is not None else None
+                    y_percent = max(3, min(97, (top_sz + 0.8 - plate_z) / (top_sz - bottom_sz + 1.6) * 100)) if plate_z is not None else None
+                    pitches.append({
+                        "number": pitch_number,
+                        "call": pitch_match.group(2).strip(),
+                        "pitch_type": option.get("stuff") or option.get("pitchType") or option.get("pitch_type"),
+                        "speed": float(speed_value) if speed_value not in (None, "") else None,
+                        "x": round(x_percent, 2) if x_percent is not None else None,
+                        "y": round(y_percent, 2) if y_percent is not None else None,
+                        "plate_x": plate_x,
+                        "plate_z": round(plate_z, 3) if plate_z is not None else None,
+                        "count": f'{state.get("ball", 0)}-{state.get("strike", 0)}',
+                        "kind": "ball" if "볼" in pitch_match.group(2) else "inplay" if "타격" in pitch_match.group(2) else "strike",
+                    })
+                elif int(option.get("type") or 0) == 13 and text:
+                    result = text.split(":", 1)[-1].strip()
+
+            pitches.sort(key=lambda pitch: pitch["number"])
+            if pitches or result:
+                at_bats[side].append({
+                    "relay_no": int(relay_row.get("no") or 0),
+                    "bat_order": int(batter.get("batOrder") or 0),
+                    "name": batter.get("name") or "",
+                    "pcode": str(batter.get("pcode") or ""),
+                    "result": result or pitches[-1]["call"],
+                    "pitches": pitches,
+                    "batter_profile": player_lookup.get(str(batter.get("pcode") or "")),
+                    "pitcher": player_lookup.get(pitcher_pcode),
+                })
+
+        for option in options:
             batter = option.get("batterRecord") or {}
             player_key = str(batter.get("pcode") or batter.get("name") or "")
             if not player_key or player_key in seen[side] or not batter.get("batOrder"):
@@ -288,6 +377,11 @@ def fetch_game_relay(game_id: str, inning: int | None = None) -> dict[str, Any]:
         for row in rows:
             row.pop("_relay_no", None)
 
+    for rows in at_bats.values():
+        rows.sort(key=lambda row: row["relay_no"])
+        for row in rows:
+            row.pop("relay_no", None)
+
     return {
         "game_id": game_id,
         "naver_game_id": naver_game_id,
@@ -295,6 +389,7 @@ def fetch_game_relay(game_id: str, inning: int | None = None) -> dict[str, Any]:
         "away_lineup": lineup("away"),
         "home_lineup": lineup("home"),
         "inning_batters": inning_batters,
+        "at_bats": at_bats,
         "source": "NAVER Sports public game relay",
     }
 
@@ -332,6 +427,172 @@ def fetch_standings(season: int) -> list[dict[str, Any]]:
         raise RuntimeError(f"{season} 시즌 팀 순위를 찾지 못했습니다.")
     _cache[key] = (time.time(), standings)
     return standings
+
+
+def fetch_hitter_advanced_rankings(season: int) -> dict[str, dict[str, float | None]]:
+    key = f"advanced-hitters:{season}"
+    if key in _cache and time.time() - _cache[key][0] < CACHE_TTL:
+        return _cache[key][1]
+
+    stat_map = {
+        "ops": "OPS",
+        "isop": "ISO",
+        "babip": "BABIP",
+        "woba": "wOBA",
+        "wrc_plus": "wRC+",
+        "war": "WAR",
+    }
+
+    def fetch_stat(item: tuple[str, str]) -> tuple[str, list[dict[str, Any]]]:
+        stat, label = item
+        response = requests.get(
+            HISTORY_RANKING_URL,
+            params={
+                "type": "hitter",
+                "stat": stat,
+                "period": season,
+                "limit": 1000,
+                "qualifyOnly": "false",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        return label, response.json().get("data") or []
+
+    merged: dict[str, dict[str, float | None]] = {}
+    with ThreadPoolExecutor(max_workers=len(stat_map)) as executor:
+        for label, rows in executor.map(fetch_stat, stat_map.items()):
+            for row in rows:
+                player_key = f"{row.get('player_name')}|{row.get('team_name')}"
+                try:
+                    value = float(row.get("value"))
+                except (TypeError, ValueError):
+                    value = None
+                merged.setdefault(player_key, {})[label] = value
+    for values in merged.values():
+        values.setdefault("WPA", None)
+    _cache[key] = (time.time(), merged)
+    return merged
+
+
+def fetch_team_season_stats(season: int) -> dict[str, dict[str, Any]]:
+    key = f"team-season-stats:{season}"
+    if key in _cache and time.time() - _cache[key][0] < CACHE_TTL:
+        return _cache[key][1]
+
+    team_response = requests.get(TEAM_LIST_URL, timeout=20)
+    team_response.raise_for_status()
+    teams = [
+        row for row in team_response.json().get("data") or []
+        if row.get("team_type") == "kbo" and row.get("is_current")
+    ]
+
+    def fetch_team(team: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        response = requests.get(TEAM_DETAIL_URL.format(team_id=team["id"]), timeout=30)
+        response.raise_for_status()
+        data = response.json().get("data") or {}
+
+        def season_row(current_key: str, history_key: str) -> dict[str, Any]:
+            current = data.get(current_key) or {}
+            if int(current.get("year") or 0) == season:
+                return current
+            return next(
+                (row for row in data.get(history_key) or [] if int(row.get("year") or 0) == season),
+                {},
+            )
+
+        hitter = season_row("teamHitterStats", "teamHitterHistory")
+        pitcher = season_row("teamPitcherStats", "teamPitcherHistory")
+        running = season_row("teamRunningStats", "teamRunningHistory")
+        return team["name"], {
+            "team_avg": float(hitter.get("avg") or 0),
+            "team_hits": int(hitter.get("hits") or 0),
+            "team_hr": int(hitter.get("hr") or 0),
+            "team_runs": int(hitter.get("runs") or 0),
+            "team_rbi": int(hitter.get("rbi") or 0),
+            "team_ops": float(hitter.get("ops") or 0),
+            "team_sb": int(running.get("sb") or 0),
+            "team_era": float(pitcher.get("era") or 0),
+            "team_whip": float(pitcher.get("whip") or 0),
+            "team_so": int(pitcher.get("so") or 0),
+        }
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        result = dict(executor.map(fetch_team, teams))
+    _cache[key] = (time.time(), result)
+    return result
+
+
+def fetch_player_profile(name: str, team: str = "", position: str = "hitter") -> dict[str, Any]:
+    """선수 기본정보, KBO 정규시즌 연도별 기록, 고급지표와 최근 5경기를 반환한다."""
+    search_response = requests.get(
+        PLAYER_SEARCH_URL,
+        params={"search": name, "limit": 20},
+        timeout=20,
+    )
+    search_response.raise_for_status()
+    candidates = search_response.json().get("data") or []
+
+    def candidate_score(row: dict[str, Any]) -> tuple[int, int, int]:
+        exact_name = int(row.get("name") == name)
+        exact_team = int(bool(team) and row.get("team_name") == team)
+        is_pitcher = row.get("position") == "투수"
+        exact_position = int(is_pitcher == (position == "pitcher"))
+        return exact_name, exact_team, exact_position
+
+    candidate = max(candidates, key=candidate_score, default=None)
+    if not candidate or candidate.get("name") != name:
+        return {"found": False, "name": name, "team": team}
+
+    detail_response = requests.get(
+        PLAYER_DETAIL_URL.format(player_id=candidate["id"]),
+        timeout=30,
+    )
+    detail_response.raise_for_status()
+    detail = detail_response.json().get("data") or {}
+    is_pitcher = detail.get("position") == "투수"
+    stat_key = "pitcher_stats" if is_pitcher else "hitter_stats"
+    career_key = "pitcher_career_advanced" if is_pitcher else "hitter_career_advanced"
+    seasons = [
+        row for row in detail.get(stat_key) or []
+        if row.get("league_type") == "kbo" and row.get("game_type") == "regular"
+    ]
+    seasons.sort(key=lambda row: int(row.get("year") or 0), reverse=True)
+    recent_games = [
+        row for row in detail.get("recent_games") or []
+        if row.get("game_type") == "regular"
+    ]
+    recent_games.sort(key=lambda row: row.get("game_date") or "", reverse=True)
+    kbo_id = str(detail.get("kbo_id") or "")
+
+    return {
+        "found": True,
+        "profile": {
+            "id": detail.get("id"),
+            "kbo_id": kbo_id,
+            "name": detail.get("name"),
+            "name_en": detail.get("name_en"),
+            "team": detail.get("team_name"),
+            "back_number": detail.get("back_number"),
+            "birth_date": detail.get("birth_date"),
+            "position": detail.get("position"),
+            "primary_pos": detail.get("primary_pos"),
+            "throws": detail.get("throws"),
+            "bats": detail.get("bats"),
+            "height": detail.get("height"),
+            "weight": detail.get("weight"),
+            "career_history": detail.get("career_history"),
+            "draft_info": detail.get("draft_info"),
+            "debut_year": (seasons[-1].get("year") if seasons else detail.get("debut_year")),
+            "image_url": detail.get("custom_image_url") or (
+                f"https://www.yagoonara.com/players/{kbo_id}.jpg" if kbo_id else None
+            ),
+        },
+        "seasons": seasons,
+        "career": detail.get(career_key) or {},
+        "recent_games": recent_games[:5],
+        "source": "yagoonara player database",
+    }
 
 
 def fetch_player_matchup(pitcher: str, batter: str) -> dict[str, Any]:

@@ -31,6 +31,10 @@ def analyze(players: list[dict[str, Any]], position: str) -> list[dict[str, Any]
             weaknesses = (["장타 생산 보완"] if slg < .400 else []) + (["출루율 개선"] if obp < .330 else [])
             stats = {key: player.get(key, 0) or 0 for key in ("G", "PA", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "HBP", "SO", "GDP", "E")}
             stats.update({"AVG": avg, "OBP": round(obp, 3), "SLG": round(slg, 3), "OPS": round(ops, 3)})
+            stats.update({
+                key: player.get(key)
+                for key in ("ISO", "BABIP", "wOBA", "wRC+", "WPA", "WAR")
+            })
             summary = f"타율 {avg:.3f}, OPS {ops:.3f}을 기록 중인 {player['team']}의 공격 자원입니다."
         else:
             era, whip, wins, so, ip = (float(player.get(k, 0) or 0) for k in ("ERA", "WHIP", "W", "SO", "IP"))
