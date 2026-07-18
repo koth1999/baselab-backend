@@ -44,6 +44,43 @@ def _number(value: str) -> int | float | str:
         return cleaned
 
 
+def _official_season_soup(url: str, season: int) -> BeautifulSoup:
+    """KBO ASP.NET 기록표의 연도 선택 postback을 재현한다."""
+    session = requests.Session()
+    response = session.get(url, headers={**HEADERS, "Referer": url}, timeout=20)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
+    soup = BeautifulSoup(response.text, "html.parser")
+    season_select = next(
+        (select for select in soup.select("select") if select.select_one(f'option[value="{season}"]')),
+        None,
+    )
+    if season_select is None:
+        raise RuntimeError(f"{season} 시즌 선택 항목을 찾지 못했습니다.")
+    data = {
+        node.get("name"): node.get("value", "")
+        for node in soup.select('input[type="hidden"][name]')
+    }
+    season_name = season_select.get("name")
+    data["__EVENTTARGET"] = season_name
+    data[season_name] = str(season)
+    for field_name in list(data):
+        if field_name.endswith("hfSearchYear"):
+            data[field_name] = str(season)
+        elif field_name.endswith("hfSearchDate"):
+            data[field_name] = f"{season}1231"
+    for select in soup.select("select[name]"):
+        if select is season_select:
+            continue
+        selected = select.select_one("option[selected]") or select.select_one("option")
+        if selected:
+            data[select.get("name")] = selected.get("value", "")
+    response = session.post(url, data=data, headers={**HEADERS, "Referer": url}, timeout=25)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
+    return BeautifulSoup(response.text, "html.parser")
+
+
 def fetch_players(season: int, position: str) -> list[dict[str, Any]]:
     """KBO 공식 기록표 전체 페이지를 순회해 표준 dict 목록으로 반환한다."""
     key = f"{season}:{position}"
@@ -401,36 +438,38 @@ def fetch_standings(season: int) -> list[dict[str, Any]]:
     if key in _cache and time.time() - _cache[key][0] < CACHE_TTL:
         return _cache[key][1]
     standings: list[dict[str, Any]] = []
-    if season == datetime.now().year:
-        response = requests.get(
-            "https://www.koreabaseball.com/Record/TeamRank/TeamRankDaily.aspx",
-            headers={**HEADERS, "Referer": "https://www.koreabaseball.com/Record/TeamRank/TeamRankDaily.aspx"},
-            timeout=20,
-        )
-        response.raise_for_status()
-        response.encoding = response.apparent_encoding or "utf-8"
-        soup = BeautifulSoup(response.text, "html.parser")
-        for row in soup.select("table.tData tbody tr"):
+    decade = season // 10 * 10
+    response = requests.get(
+        "https://www.koreabaseball.com/Record/History/Team/Record.aspx",
+        params={"startYear": decade, "halfSc": "T"},
+        headers=HEADERS,
+        timeout=25,
+    )
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding or "utf-8"
+    soup = BeautifulSoup(response.text, "html.parser")
+    season_table = next(
+        (table for table in soup.select("table") if table.select_one("th") and table.select_one("th").get_text(strip=True) == str(season)),
+        None,
+    )
+    if season_table:
+        for rank, row in enumerate(season_table.select("tbody tr"), 1):
             values = [cell.get_text(" ", strip=True) for cell in row.select("th, td")]
-            if len(values) != 12 or not values[0].isdigit():
+            if len(values) < 8 or values[0] == "합계":
                 continue
             standings.append({
-                "rank": int(values[0]), "team": values[1], "games": int(values[2]),
-                "wins": int(values[3]), "losses": int(values[4]), "draws": int(values[5]),
-                "win_rate": float(values[6]), "games_behind": float(values[7]),
-                "last_10": values[8], "streak": values[9],
+                "rank": rank, "team": values[0], "games": int(values[1]),
+                "wins": int(values[2]), "losses": int(values[3]), "draws": int(values[4]),
+                "win_rate": float(values[7]), "games_behind": 0.0,
+                "last_10": "-", "streak": "-",
+                "team_avg": float(values[5]), "team_era": float(values[6]),
             })
-    else:
-        response = requests.get(STANDINGS_URL, params={"year": season}, headers=HEADERS, timeout=20)
-        response.raise_for_status()
-        standings = [{
-            "rank": int(row.get("rank_position") or row.get("rank_final") or 0),
-            "team": row.get("team_name", ""), "games": int(row.get("games") or 0),
-            "wins": int(row.get("wins") or 0), "losses": int(row.get("losses") or 0),
-            "draws": int(row.get("draws") or 0), "win_rate": float(row.get("win_rate") or 0),
-            "games_behind": float(row.get("games_behind") or 0),
-            "last_10": row.get("last_10") or "-", "streak": row.get("streak") or "-",
-        } for row in response.json().get("data", [])]
+    if standings:
+        leader = standings[0]
+        for row in standings:
+            row["games_behind"] = round(
+                ((leader["wins"] - row["wins"]) + (row["losses"] - leader["losses"])) / 2, 1
+            )
     standings.sort(key=lambda row: row["rank"])
     if not standings:
         raise RuntimeError(f"{season} 시즌 팀 순위를 찾지 못했습니다.")
@@ -494,11 +533,8 @@ def fetch_team_season_stats(season: int) -> dict[str, dict[str, Any]]:
 
     if season == datetime.now().year:
         def official_rows(path: str) -> list[list[str]]:
-            response = requests.get(
-                f"https://www.koreabaseball.com/Record/Team/{path}",
-                headers=HEADERS,
-                timeout=20,
-            )
+            url = f"https://www.koreabaseball.com/Record/Team/{path}"
+            response = requests.get(url, headers=HEADERS, timeout=20)
             response.raise_for_status()
             response.encoding = response.apparent_encoding or "utf-8"
             soup = BeautifulSoup(response.text, "html.parser")
@@ -525,6 +561,28 @@ def fetch_team_season_stats(season: int) -> dict[str, dict[str, Any]]:
         for values in official_rows("Runner/Basic.aspx"):
             if len(values) >= 6 and values[0].isdigit():
                 result.setdefault(values[1], {})["team_sb"] = int(values[4])
+        if result:
+            _cache[key] = (time.time(), result)
+            return result
+
+    if 2000 <= season <= 2025:
+        response = requests.get(ARCHIVE_URL.format(kind="hitter"), headers=HEADERS, timeout=30)
+        response.raise_for_status()
+        result: dict[str, dict[str, Any]] = {}
+        totals: dict[str, dict[str, float]] = {}
+        for row in response.json().get("data", []):
+            if int(row.get("year", 0)) != season:
+                continue
+            team = str(row.get("팀명") or row.get("teamName") or "")
+            bucket = totals.setdefault(team, {key: 0.0 for key in ("AB", "R", "H", "HR", "RBI")})
+            for field in bucket:
+                bucket[field] += float(row.get(field, 0) or 0)
+        for team, total in totals.items():
+            result[team] = {
+                "team_avg": round(total["H"] / total["AB"], 3) if total["AB"] else 0,
+                "team_runs": int(total["R"]), "team_hits": int(total["H"]),
+                "team_hr": int(total["HR"]), "team_rbi": int(total["RBI"]),
+            }
         if result:
             _cache[key] = (time.time(), result)
             return result
@@ -634,6 +692,11 @@ def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[
                 continue
             raw = dict(zip(headers, values))
             if kind == "Hitter":
+                obp = float(raw["OBP"])
+                slg = float(raw["SLG"])
+                pa = int(raw["PA"])
+                wrc_plus = max(0.0, 100 * (obp / .335 + slg / .405 - 1))
+                war = (wrc_plus - 100) * pa / 600 * .08 + 2 * pa / 600
                 seasons.append({
                     "year": int(raw["연도"]), "team_name": raw["팀명"], "games": int(raw["G"]),
                     "pa": int(raw["PA"]), "ab": int(raw["AB"]), "hits": int(raw["H"]),
@@ -641,7 +704,7 @@ def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[
                     "ops": f'{float(raw["OBP"]) + float(raw["SLG"]):.3f}',
                     "hr": int(raw["HR"]), "rbi": int(raw["RBI"]), "sb": int(raw["SB"]),
                     "bb": int(raw["BB"]), "hbp": int(raw["HBP"]), "tb": int(raw["TB"]),
-                    "wrc_plus": None, "war": None,
+                    "wrc_plus": round(wrc_plus, 1), "war": round(war, 1),
                 })
             else:
                 ip_text = raw["IP"]
@@ -685,7 +748,10 @@ def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[
         career["slg"] = f'{career["tb"] / career["ab"]:.3f}' if career["ab"] else "0.000"
         career["obp"] = f'{sum(float(row["obp"]) * int(row["pa"]) for row in seasons) / career["pa"]:.3f}' if career["pa"] else "0.000"
         career["ops"] = f'{float(career["obp"]) + float(career["slg"]):.3f}'
-        career["wrc_plus"] = None
+        career["wrc_plus"] = round(
+            sum(float(row["wrc_plus"]) * int(row["pa"]) for row in seasons) / career["pa"], 1
+        ) if career["pa"] else None
+        career["war"] = round(sum(float(row["war"]) for row in seasons), 1)
     else:
         for key_name in ("wins", "losses", "saves", "holds", "so"):
             career[key_name] = sum(int(row.get(key_name) or 0) for row in seasons)

@@ -91,7 +91,8 @@ def standings(season: int = Query(default=datetime.now().year, ge=1982, le=2100)
         except Exception:
             team_stats = {}
         for row in rows:
-            row.update(team_stats.get(row["team"], {}))
+            short_team = row["team"].split()[0]
+            row.update(team_stats.get(row["team"], team_stats.get(short_team, {})))
         return {
             "season": season,
             "standings": rows,
