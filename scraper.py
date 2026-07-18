@@ -572,14 +572,148 @@ def fetch_team_season_stats(season: int) -> dict[str, dict[str, Any]]:
     return result
 
 
-def fetch_player_profile(name: str, team: str = "", position: str = "hitter") -> dict[str, Any]:
-    """선수 기본정보, KBO 정규시즌 연도별 기록, 고급지표와 최근 5경기를 반환한다."""
-    search_response = requests.get(
-        PLAYER_SEARCH_URL,
-        params={"search": name, "limit": 20},
+def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[str, Any]:
+    """KBO 공식 선수 검색과 상세 기록표를 이용하는 프로필 대체 경로."""
+    search = requests.post(
+        "https://www.koreabaseball.com/ws/Controls.asmx/GetSearchPlayer",
+        data={"name": name},
+        headers={**HEADERS, "Referer": "https://www.koreabaseball.com/Player/Search.aspx", "X-Requested-With": "XMLHttpRequest"},
         timeout=20,
     )
-    search_response.raise_for_status()
+    search.raise_for_status()
+    payload = search.json()
+    candidates = (payload.get("now") or []) + (payload.get("retire") or [])
+    want_pitcher = position == "pitcher"
+
+    def score(row: dict[str, Any]) -> tuple[int, int, int]:
+        return (
+            int(row.get("P_NM") == name),
+            int(bool(team) and row.get("T_NM") == team),
+            int((row.get("POS_NO") == "투수") == want_pitcher),
+        )
+
+    player = max(candidates, key=score, default=None)
+    if not player or player.get("P_NM") != name:
+        return {"found": False, "name": name, "team": team}
+
+    player_id = str(player.get("P_ID") or "")
+    kind = "Pitcher" if player.get("POS_NO") == "투수" else "Hitter"
+    base = f"https://www.koreabaseball.com/Record/Player/{kind}Detail"
+
+    def soup_for(leaf: str) -> BeautifulSoup:
+        response = requests.get(f"{base}/{leaf}.aspx", params={"playerId": player_id}, headers=HEADERS, timeout=20)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        return BeautifulSoup(response.text, "html.parser")
+
+    basic_soup = soup_for("Basic")
+    total_soup = soup_for("Total")
+    basic = basic_soup.select_one(".player_basic")
+
+    def field(suffix: str) -> str:
+        node = basic.select_one(f'[id$="{suffix}"]') if basic else None
+        return node.get_text(" ", strip=True) if node else ""
+
+    position_text = field("lblPosition") or str(player.get("POS_NO") or "")
+    type_match = re.search(r"\(([^)]+)\)", position_text)
+    player_type = type_match.group(1) if type_match else str(player.get("P_TYPE") or "")
+    size_match = re.search(r"(\d+)cm/(\d+)kg", field("lblHeightWeight"))
+    birth = field("lblBirthday").replace("년 ", "-").replace("월 ", "-").replace("일", "")
+    image = basic.select_one("img") if basic else None
+    image_url = image.get("src") if image else None
+    if image_url and image_url.startswith("//"):
+        image_url = "https:" + image_url
+
+    table = total_soup.select_one("table")
+    headers = [cell.get_text(" ", strip=True) for cell in table.select("thead th")] if table else []
+    seasons: list[dict[str, Any]] = []
+    if table:
+        for tr in table.select("tbody tr"):
+            values = [cell.get_text(" ", strip=True) for cell in tr.select("td")]
+            if len(values) != len(headers) or not values[0].isdigit():
+                continue
+            raw = dict(zip(headers, values))
+            if kind == "Hitter":
+                seasons.append({
+                    "year": int(raw["연도"]), "team_name": raw["팀명"], "games": int(raw["G"]),
+                    "pa": int(raw["PA"]), "ab": int(raw["AB"]), "hits": int(raw["H"]),
+                    "avg": raw["AVG"], "obp": raw["OBP"], "slg": raw["SLG"],
+                    "ops": f'{float(raw["OBP"]) + float(raw["SLG"]):.3f}',
+                    "hr": int(raw["HR"]), "rbi": int(raw["RBI"]), "sb": int(raw["SB"]),
+                    "bb": int(raw["BB"]), "hbp": int(raw["HBP"]), "tb": int(raw["TB"]),
+                    "wrc_plus": None, "war": None,
+                })
+            else:
+                ip_text = raw["IP"]
+                ip_parts = ip_text.split()
+                innings = float(ip_parts[0]) if ip_parts else 0.0
+                if len(ip_parts) > 1:
+                    innings += {"1/3": 1 / 3, "2/3": 2 / 3}.get(ip_parts[1], 0)
+                whip = (int(raw["H"]) + int(raw["BB"])) / innings if innings else 0
+                seasons.append({
+                    "year": int(raw["연도"]), "team_name": raw["팀명"], "games": int(raw["G"]),
+                    "innings": raw["IP"], "ip": raw["IP"], "era": raw["ERA"],
+                    "wins": int(raw["W"]), "losses": int(raw["L"]), "saves": int(raw["SV"]),
+                    "holds": int(raw["HLD"]), "so": int(raw["SO"]), "whip": f"{whip:.2f}", "war": None,
+                })
+    seasons.sort(key=lambda row: row["year"], reverse=True)
+
+    recent_games: list[dict[str, Any]] = []
+    tables = basic_soup.select("table")
+    if len(tables) >= 3:
+        current_year = datetime.now().year
+        for tr in tables[2].select("tbody tr")[:5]:
+            values = [cell.get_text(" ", strip=True) for cell in tr.select("td")]
+            if kind == "Hitter" and len(values) >= 17:
+                recent_games.append({
+                    "game_date": f"{current_year}-{values[0].replace('.', '-')}", "opponent": values[1],
+                    "h_ab": int(values[4]), "h_hits": int(values[6]), "h_hr": int(values[9]),
+                    "h_rbi": int(values[10]), "h_so": int(values[15]),
+                })
+
+    career: dict[str, Any] = {
+        "seasons": len(seasons),
+        "first_year": seasons[-1]["year"] if seasons else None,
+        "last_year": seasons[0]["year"] if seasons else None,
+        "games": sum(int(row.get("games") or 0) for row in seasons),
+        "war": None,
+    }
+    if kind == "Hitter":
+        for key_name in ("pa", "ab", "hits", "hr", "rbi", "sb", "bb", "hbp", "tb"):
+            career[key_name] = sum(int(row.get(key_name) or 0) for row in seasons)
+        career["avg"] = f'{career["hits"] / career["ab"]:.3f}' if career["ab"] else "0.000"
+        career["slg"] = f'{career["tb"] / career["ab"]:.3f}' if career["ab"] else "0.000"
+        career["obp"] = f'{sum(float(row["obp"]) * int(row["pa"]) for row in seasons) / career["pa"]:.3f}' if career["pa"] else "0.000"
+        career["ops"] = f'{float(career["obp"]) + float(career["slg"]):.3f}'
+        career["wrc_plus"] = None
+    else:
+        for key_name in ("wins", "losses", "saves", "holds", "so"):
+            career[key_name] = sum(int(row.get(key_name) or 0) for row in seasons)
+        career.update({"innings": "-", "era": "-", "whip": "-"})
+
+    return {
+        "found": True,
+        "profile": {
+            "kbo_id": player_id, "name": player.get("P_NM"), "name_en": "", "team": player.get("T_NM"),
+            "back_number": str(player.get("BACK_NO") or ""), "birth_date": birth,
+            "position": player.get("POS_NO"), "primary_pos": position_text.split("(")[0],
+            "throws": "좌" if "좌투" in player_type else "우", "bats": "좌" if "좌타" in player_type else "양" if "양타" in player_type else "우",
+            "height": int(size_match.group(1)) if size_match else 0, "weight": int(size_match.group(2)) if size_match else 0,
+            "career_history": field("lblCareer"), "draft_info": field("lblDraft"),
+            "debut_year": seasons[-1]["year"] if seasons else None, "image_url": image_url,
+        },
+        "seasons": seasons, "career": career, "recent_games": recent_games,
+        "source": "KBO official player records",
+    }
+
+
+def fetch_player_profile(name: str, team: str = "", position: str = "hitter") -> dict[str, Any]:
+    """선수 기본정보, KBO 정규시즌 연도별 기록, 고급지표와 최근 5경기를 반환한다."""
+    try:
+        search_response = requests.get(PLAYER_SEARCH_URL, params={"search": name, "limit": 20}, timeout=20)
+        search_response.raise_for_status()
+    except requests.RequestException:
+        return _fetch_official_player_profile(name, team, position)
     candidates = search_response.json().get("data") or []
 
     def candidate_score(row: dict[str, Any]) -> tuple[int, int, int]:
@@ -593,11 +727,11 @@ def fetch_player_profile(name: str, team: str = "", position: str = "hitter") ->
     if not candidate or candidate.get("name") != name:
         return {"found": False, "name": name, "team": team}
 
-    detail_response = requests.get(
-        PLAYER_DETAIL_URL.format(player_id=candidate["id"]),
-        timeout=30,
-    )
-    detail_response.raise_for_status()
+    try:
+        detail_response = requests.get(PLAYER_DETAIL_URL.format(player_id=candidate["id"]), timeout=30)
+        detail_response.raise_for_status()
+    except requests.RequestException:
+        return _fetch_official_player_profile(name, team, position)
     detail = detail_response.json().get("data") or {}
     is_pitcher = detail.get("position") == "투수"
     stat_key = "pitcher_stats" if is_pitcher else "hitter_stats"

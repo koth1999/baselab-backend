@@ -104,8 +104,8 @@ def standings(season: int = Query(default=datetime.now().year, ge=1982, le=2100)
 def matchup(pitcher: str = Query(min_length=1), batter: str = Query(min_length=1)) -> dict:
     try:
         return fetch_player_matchup(pitcher.strip(), batter.strip())
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"투수·타자 상대전적 수집 실패: {exc}") from exc
+    except Exception:
+        return {"found": False, "pitcher": pitcher.strip(), "batter": batter.strip()}
 
 
 @app.get("/api/player-profile")
