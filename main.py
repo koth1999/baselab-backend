@@ -38,7 +38,10 @@ def players(
         if position == "hitter":
             required = team_games * 3.1
             qualified = [record for record in records if float(record.get("PA", 0) or 0) >= required]
-            advanced = fetch_hitter_advanced_rankings(season)
+            try:
+                advanced = fetch_hitter_advanced_rankings(season)
+            except Exception:
+                advanced = {}
             for record in qualified:
                 record.update(advanced.get(f"{record.get('name')}|{record.get('team')}", {}))
             qualification_label = f"규정타석 {required:.1f} 이상 ({team_games}경기 × 3.1)"
@@ -82,7 +85,10 @@ def game_relay(
 def standings(season: int = Query(default=datetime.now().year, ge=1982, le=2100)) -> dict:
     try:
         rows = fetch_standings(season)
-        team_stats = fetch_team_season_stats(season)
+        try:
+            team_stats = fetch_team_season_stats(season)
+        except Exception:
+            team_stats = {}
         for row in rows:
             row.update(team_stats.get(row["team"], {}))
         return {

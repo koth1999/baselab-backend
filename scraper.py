@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import math
 import time
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -399,29 +400,37 @@ def fetch_standings(season: int) -> list[dict[str, Any]]:
     key = f"standings:{season}"
     if key in _cache and time.time() - _cache[key][0] < CACHE_TTL:
         return _cache[key][1]
-    response = requests.get(
-        STANDINGS_URL,
-        params={"year": season},
-        headers=HEADERS,
-        timeout=20,
-    )
-    response.raise_for_status()
-    rows = response.json().get("data", [])
-    standings = [
-        {
+    standings: list[dict[str, Any]] = []
+    if season == datetime.now().year:
+        response = requests.get(
+            "https://www.koreabaseball.com/Record/TeamRank/TeamRankDaily.aspx",
+            headers={**HEADERS, "Referer": "https://www.koreabaseball.com/Record/TeamRank/TeamRankDaily.aspx"},
+            timeout=20,
+        )
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding or "utf-8"
+        soup = BeautifulSoup(response.text, "html.parser")
+        for row in soup.select("table.tData tbody tr"):
+            values = [cell.get_text(" ", strip=True) for cell in row.select("th, td")]
+            if len(values) != 12 or not values[0].isdigit():
+                continue
+            standings.append({
+                "rank": int(values[0]), "team": values[1], "games": int(values[2]),
+                "wins": int(values[3]), "losses": int(values[4]), "draws": int(values[5]),
+                "win_rate": float(values[6]), "games_behind": float(values[7]),
+                "last_10": values[8], "streak": values[9],
+            })
+    else:
+        response = requests.get(STANDINGS_URL, params={"year": season}, headers=HEADERS, timeout=20)
+        response.raise_for_status()
+        standings = [{
             "rank": int(row.get("rank_position") or row.get("rank_final") or 0),
-            "team": row.get("team_name", ""),
-            "games": int(row.get("games") or 0),
-            "wins": int(row.get("wins") or 0),
-            "losses": int(row.get("losses") or 0),
-            "draws": int(row.get("draws") or 0),
-            "win_rate": float(row.get("win_rate") or 0),
+            "team": row.get("team_name", ""), "games": int(row.get("games") or 0),
+            "wins": int(row.get("wins") or 0), "losses": int(row.get("losses") or 0),
+            "draws": int(row.get("draws") or 0), "win_rate": float(row.get("win_rate") or 0),
             "games_behind": float(row.get("games_behind") or 0),
-            "last_10": row.get("last_10") or "-",
-            "streak": row.get("streak") or "-",
-        }
-        for row in rows
-    ]
+            "last_10": row.get("last_10") or "-", "streak": row.get("streak") or "-",
+        } for row in response.json().get("data", [])]
     standings.sort(key=lambda row: row["rank"])
     if not standings:
         raise RuntimeError(f"{season} 시즌 팀 순위를 찾지 못했습니다.")
@@ -456,8 +465,11 @@ def fetch_hitter_advanced_rankings(season: int) -> dict[str, dict[str, float | N
             },
             timeout=20,
         )
-        response.raise_for_status()
-        return label, response.json().get("data") or []
+        try:
+            response.raise_for_status()
+            return label, response.json().get("data") or []
+        except requests.RequestException:
+            return label, []
 
     merged: dict[str, dict[str, float | None]] = {}
     with ThreadPoolExecutor(max_workers=len(stat_map)) as executor:
@@ -479,6 +491,43 @@ def fetch_team_season_stats(season: int) -> dict[str, dict[str, Any]]:
     key = f"team-season-stats:{season}"
     if key in _cache and time.time() - _cache[key][0] < CACHE_TTL:
         return _cache[key][1]
+
+    if season == datetime.now().year:
+        def official_rows(path: str) -> list[list[str]]:
+            response = requests.get(
+                f"https://www.koreabaseball.com/Record/Team/{path}",
+                headers=HEADERS,
+                timeout=20,
+            )
+            response.raise_for_status()
+            response.encoding = response.apparent_encoding or "utf-8"
+            soup = BeautifulSoup(response.text, "html.parser")
+            return [
+                [cell.get_text(" ", strip=True) for cell in row.select("th, td")]
+                for row in soup.select("table.tData01 tbody tr, table.tData tbody tr")
+            ]
+
+        result: dict[str, dict[str, Any]] = {}
+        for values in official_rows("Hitter/Basic1.aspx"):
+            if len(values) >= 15 and values[0].isdigit():
+                result.setdefault(values[1], {}).update({
+                    "team_avg": float(values[2]), "team_runs": int(values[6]),
+                    "team_hits": int(values[7]), "team_hr": int(values[10]), "team_rbi": int(values[12]),
+                })
+        for values in official_rows("Hitter/Basic2.aspx"):
+            if len(values) >= 11 and values[0].isdigit():
+                result.setdefault(values[1], {})["team_ops"] = float(values[10])
+        for values in official_rows("Pitcher/Basic1.aspx"):
+            if len(values) >= 18 and values[0].isdigit():
+                result.setdefault(values[1], {}).update({
+                    "team_era": float(values[2]), "team_so": int(values[14]), "team_whip": float(values[17]),
+                })
+        for values in official_rows("Runner/Basic.aspx"):
+            if len(values) >= 6 and values[0].isdigit():
+                result.setdefault(values[1], {})["team_sb"] = int(values[4])
+        if result:
+            _cache[key] = (time.time(), result)
+            return result
 
     team_response = requests.get(TEAM_LIST_URL, timeout=20)
     team_response.raise_for_status()
