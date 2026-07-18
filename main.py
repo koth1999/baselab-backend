@@ -55,6 +55,7 @@ def players(
             "team_games": team_games,
             "qualification": required,
             "qualification_label": qualification_label,
+            "advanced_stats_note": "외부 공식 고급지표가 없을 때 KBO 기본 기록으로 계산한 추정치입니다.",
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "players": analyze(qualified, position),
         }

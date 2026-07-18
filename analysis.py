@@ -15,9 +15,41 @@ def _grade(score: int) -> str:
     return "S" if score >= 95 else "A+" if score >= 90 else "A" if score >= 82 else "B+" if score >= 74 else "B" if score >= 65 else "C"
 
 
+def _hitter_metrics(player: dict[str, Any]) -> dict[str, float]:
+    """기본 타격 기록으로 계산 가능한 세이버 지표와 기여도 추정치를 만든다."""
+    ab, hits, bb, hbp, so, pa = (
+        float(player.get(key, 0) or 0)
+        for key in ("AB", "H", "BB", "HBP", "SO", "PA")
+    )
+    doubles, triples, hr, sb, cs = (
+        float(player.get(key, 0) or 0)
+        for key in ("2B", "3B", "HR", "SB", "CS")
+    )
+    singles = max(0.0, hits - doubles - triples - hr)
+    sf = max(0.0, pa - ab - bb - hbp)
+    avg = hits / ab if ab else 0.0
+    slg = (singles + 2 * doubles + 3 * triples + 4 * hr) / ab if ab else 0.0
+    babip_denominator = ab - so - hr + sf
+    woba_denominator = ab + bb + hbp + sf
+    return {
+        "ISO": max(0.0, slg - avg),
+        "BABIP": (hits - hr) / babip_denominator if babip_denominator > 0 else 0.0,
+        "wOBA": (
+            .69 * bb + .72 * hbp + .89 * singles + 1.27 * doubles + 1.62 * triples + 2.10 * hr
+        ) / woba_denominator if woba_denominator > 0 else 0.0,
+    }
+
+
 def analyze(players: list[dict[str, Any]], position: str) -> list[dict[str, Any]]:
+    calculated_hitters = [_hitter_metrics(player) for player in players] if position == "hitter" else []
+    league_woba = (
+        sum(metric["wOBA"] * float(player.get("PA", 0) or 0) for metric, player in zip(calculated_hitters, players))
+        / sum(float(player.get("PA", 0) or 0) for player in players)
+        if players and sum(float(player.get("PA", 0) or 0) for player in players) > 0
+        else .320
+    )
     analyzed = []
-    for player in players:
+    for player_index, player in enumerate(players):
         if position == "hitter":
             ab, hits, bb, hbp, sf = (float(player.get(k, 0) or 0) for k in ("AB", "H", "BB", "HBP", "SF"))
             doubles, triples, hr = (float(player.get(k, 0) or 0) for k in ("2B", "3B", "HR"))
@@ -31,8 +63,23 @@ def analyze(players: list[dict[str, Any]], position: str) -> list[dict[str, Any]
             weaknesses = (["장타 생산 보완"] if slg < .400 else []) + (["출루율 개선"] if obp < .330 else [])
             stats = {key: player.get(key, 0) or 0 for key in ("G", "PA", "AB", "H", "2B", "3B", "HR", "RBI", "SB", "CS", "BB", "HBP", "SO", "GDP", "E")}
             stats.update({"AVG": avg, "OBP": round(obp, 3), "SLG": round(slg, 3), "OPS": round(ops, 3)})
+            calculated = calculated_hitters[player_index]
+            pa = float(player.get("PA", 0) or 0)
+            sb = float(player.get("SB", 0) or 0)
+            cs = float(player.get("CS", 0) or 0)
+            batting_runs = (calculated["wOBA"] - league_woba) / 1.25 * pa
+            base_running_runs = .2 * (sb - .4 * cs)
+            replacement_runs = 20 * pa / 600
+            estimates = {
+                "ISO": round(calculated["ISO"], 3),
+                "BABIP": round(calculated["BABIP"], 3),
+                "wOBA": round(calculated["wOBA"], 3),
+                "wRC+": round(100 * calculated["wOBA"] / league_woba, 1) if league_woba else 100.0,
+                "WPA": round(batting_runs / 10, 2),
+                "WAR": round((batting_runs + base_running_runs + replacement_runs) / 10, 1),
+            }
             stats.update({
-                key: player.get(key)
+                key: player.get(key) if player.get(key) is not None else estimates[key]
                 for key in ("ISO", "BABIP", "wOBA", "wRC+", "WPA", "WAR")
             })
             summary = f"타율 {avg:.3f}, OPS {ops:.3f}을 기록 중인 {player['team']}의 공격 자원입니다."
