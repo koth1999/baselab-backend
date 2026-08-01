@@ -99,8 +99,9 @@ def fetch_players(season: int, position: str) -> list[dict[str, Any]]:
     columns = HITTER_COLUMNS if is_hitter else PITCHER_COLUMNS
     players: list[dict[str, Any]] = []
 
-    # KBO 표는 qs_page에 따라 페이지가 바뀐다. 빈 페이지를 만나면 종료한다.
-    for page in range(1, 8):
+    # KBO 표는 qs_page에 따라 페이지가 바뀐다. 현재 시즌 첫 조회가
+    # 순차 네트워크 왕복으로 느려지지 않도록 최대 4개씩 병렬 수집한다.
+    def fetch_page(page: int) -> tuple[int, list[dict[str, Any]]]:
         response = requests.get(
             f"{BASE_URL}/{path}",
             params={"seasonId": season, "seriesId": "0", "page": page},
@@ -124,12 +125,16 @@ def fetch_players(season: int, position: str) -> list[dict[str, Any]]:
                 continue
             item["position"] = "타자" if is_hitter else "투수"
             page_players.append(item)
+        return page, page_players
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        pages = sorted(executor.map(fetch_page, range(1, 8)), key=lambda result: result[0])
+
+    for _, page_players in pages:
         if not page_players:
-            break
+            continue
         known = {(p["name"], p["team"]) for p in players}
         players.extend(p for p in page_players if (p["name"], p["team"]) not in known)
-        if len(page_players) < 20:
-            break
 
     if not players:
         raise RuntimeError("KBO 기록표를 찾지 못했습니다. 원본 페이지 구조를 확인해 주세요.")
@@ -470,6 +475,28 @@ def fetch_standings(season: int) -> list[dict[str, Any]]:
             row["games_behind"] = round(
                 ((leader["wins"] - row["wins"]) + (row["losses"] - leader["losses"])) / 2, 1
             )
+
+        # KBO 역사 기록표에는 최근 10경기와 연속 기록이 없으므로
+        # 시즌별 순위 API의 값을 팀명(약칭) 기준으로 결합한다.
+        try:
+            recent_response = requests.get(
+                STANDINGS_URL,
+                params={"year": season},
+                timeout=20,
+            )
+            recent_response.raise_for_status()
+            recent_by_team = {
+                str(item.get("team_name") or "").strip(): item
+                for item in recent_response.json().get("data") or []
+            }
+            for row in standings:
+                short_team = str(row["team"]).split()[0]
+                recent = recent_by_team.get(short_team)
+                if recent:
+                    row["last_10"] = recent.get("last_10") or "-"
+                    row["streak"] = recent.get("streak") or "-"
+        except (requests.RequestException, ValueError, TypeError):
+            pass
     standings.sort(key=lambda row: row["rank"])
     if not standings:
         raise RuntimeError(f"{season} 시즌 팀 순위를 찾지 못했습니다.")
@@ -587,6 +614,40 @@ def fetch_team_season_stats(season: int) -> dict[str, dict[str, Any]]:
             _cache[key] = (time.time(), result)
             return result
 
+    if season < 2000:
+        # 초기 시즌도 선수별 시즌 합계를 팀 단위로 집계한다.
+        # 팀 타율과 팀 방어율은 fetch_standings()의 KBO 공식 값이 사용된다.
+        stat_fields = {"hr": "team_hr", "rbi": "team_rbi", "runs": "team_runs"}
+
+        def fetch_total(item: tuple[str, str]) -> tuple[str, list[dict[str, Any]]]:
+            stat, field = item
+            response = requests.get(
+                HISTORY_RANKING_URL,
+                params={
+                    "type": "hitter",
+                    "stat": stat,
+                    "period": season,
+                    "limit": 1000,
+                    "qualifyOnly": "false",
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            return field, response.json().get("data") or []
+
+        result: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=len(stat_fields)) as executor:
+            for field, rows in executor.map(fetch_total, stat_fields.items()):
+                for row in rows:
+                    team = str(row.get("team_name") or "").strip()
+                    if team:
+                        result.setdefault(team, {})[field] = (
+                            result.setdefault(team, {}).get(field, 0) + int(float(row.get("value") or 0))
+                        )
+        if result:
+            _cache[key] = (time.time(), result)
+            return result
+
     team_response = requests.get(TEAM_LIST_URL, timeout=20)
     team_response.raise_for_status()
     teams = [
@@ -700,6 +761,7 @@ def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[
                 seasons.append({
                     "year": int(raw["연도"]), "team_name": raw["팀명"], "games": int(raw["G"]),
                     "pa": int(raw["PA"]), "ab": int(raw["AB"]), "hits": int(raw["H"]),
+                    "runs": int(raw.get("R", 0) or 0),
                     "avg": raw["AVG"], "obp": raw["OBP"], "slg": raw["SLG"],
                     "ops": f'{float(raw["OBP"]) + float(raw["SLG"]):.3f}',
                     "hr": int(raw["HR"]), "rbi": int(raw["RBI"]), "sb": int(raw["SB"]),
@@ -742,7 +804,7 @@ def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[
         "war": None,
     }
     if kind == "Hitter":
-        for key_name in ("pa", "ab", "hits", "hr", "rbi", "sb", "bb", "hbp", "tb"):
+        for key_name in ("pa", "ab", "hits", "runs", "hr", "rbi", "sb", "bb", "hbp", "tb"):
             career[key_name] = sum(int(row.get(key_name) or 0) for row in seasons)
         career["avg"] = f'{career["hits"] / career["ab"]:.3f}' if career["ab"] else "0.000"
         career["slg"] = f'{career["tb"] / career["ab"]:.3f}' if career["ab"] else "0.000"
@@ -773,7 +835,7 @@ def _fetch_official_player_profile(name: str, team: str, position: str) -> dict[
     }
 
 
-def fetch_player_profile(name: str, team: str = "", position: str = "hitter") -> dict[str, Any]:
+def _fetch_player_profile_uncached(name: str, team: str = "", position: str = "hitter") -> dict[str, Any]:
     """선수 기본정보, KBO 정규시즌 연도별 기록, 고급지표와 최근 5경기를 반환한다."""
     try:
         search_response = requests.get(PLAYER_SEARCH_URL, params={"search": name, "limit": 20}, timeout=20)
@@ -842,6 +904,17 @@ def fetch_player_profile(name: str, team: str = "", position: str = "hitter") ->
         "recent_games": recent_games[:5],
         "source": "yagoonara player database",
     }
+
+
+def fetch_player_profile(name: str, team: str = "", position: str = "hitter") -> dict[str, Any]:
+    """선수 상세 정보를 10분간 캐시해 반복 전환 시 외부 요청을 생략한다."""
+    key = f"player-profile:{name.strip()}:{team.strip()}:{position}"
+    cached = _cache.get(key)
+    if cached and time.time() - cached[0] < CACHE_TTL:
+        return cached[1]
+    result = _fetch_player_profile_uncached(name, team, position)
+    _cache[key] = (time.time(), result)
+    return result
 
 
 def fetch_player_matchup(pitcher: str, batter: str) -> dict[str, Any]:
